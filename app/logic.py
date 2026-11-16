@@ -9,6 +9,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 
 CANON_FMT = "%Y-%m-%dT%H:%M:%SZ"
+# 带小数秒的规范形（微秒为 0 时仍用 CANON_FMT，保证与旧库整秒记录文本完全一致）
+CANON_FRAC_FMT = "%Y-%m-%dT%H:%M:%S.%fZ"
 
 # 测试专用钩子：在生成事务持有写锁期间被调用，用于验证快照隔离。生产环境保持 None。
 SNAPSHOT_TEST_HOOK: Optional[Callable[[], None]] = None
@@ -34,7 +36,12 @@ class CsvFormatError(ValueError):
 # ---------------------------------------------------------------- 时间处理
 
 def parse_utc(value: str) -> datetime:
-    """解析 UTC 时间，容忍 Z 后缀、+00:00、空格分隔与裸时间（视为 UTC）。"""
+    """解析 UTC 时间，容忍 Z 后缀、+00:00、空格分隔与裸时间（视为 UTC）。
+
+    保留合法 ISO 8601 小数秒（微秒精度），不再截断到整秒：
+    - ``2026-02-28T00:00:00.5Z`` 与 ``...00.500000+00:00`` 解析为同一时刻；
+    - 小数秒超出微秒精度（多于 6 位）无法无损表示，直接报错而非静默截断。
+    """
     s = (value or "").strip()
     if not s:
         raise ValueError("时间为空")
@@ -53,19 +60,34 @@ def parse_utc(value: str) -> datetime:
         raise ValueError(f"无法解析时间 {value!r}，需为 ISO 8601（UTC）")
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).replace(microsecond=0)
+    dt = dt.astimezone(timezone.utc)
+    # fromisoformat 对多于 6 位小数会静默截断，这里显式拒绝以免丢失真实时刻
+    if "." in iso or "," in iso:
+        frac = iso.replace(",", ".").rsplit(".", 1)[1]
+        digits = frac.split("+", 1)[0].split("-", 1)[0].rstrip("Z")
+        if len(digits) > 6:
+            raise ValueError(f"时间 {value!r} 小数秒超出微秒精度（最多 6 位）")
+    return dt
 
 
 def parse_hour(value: str) -> datetime:
-    """解析目标小时，必须整点对齐。"""
+    """解析目标小时，必须整点对齐（含小数秒的非整点一律拒绝）。"""
     dt = parse_utc(value)
-    if dt.minute or dt.second:
+    if dt.minute or dt.second or dt.microsecond:
         raise ValueError(f"目标小时 {value!r} 未整点对齐")
     return dt
 
 
 def canon(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).strftime(CANON_FMT)
+    """UTC 规范形：整秒沿用旧格式 ``...SSZ``；带小数秒输出 ``...SS.ffffffZ``。"""
+    dt = dt.astimezone(timezone.utc)
+    fmt = CANON_FMT if dt.microsecond == 0 else CANON_FRAC_FMT
+    return dt.strftime(fmt)
+
+
+def parse_canon(value: str) -> datetime:
+    """把库中规范形文本还原为真实时刻（datetime），用于排序与截止比较。"""
+    return parse_utc(value)
 
 
 # ---------------------------------------------------------------- CSV 解析
@@ -225,17 +247,26 @@ def build_pairs(conn, station: str, start_dt: datetime, end_dt: datetime, lead_h
     """逐目标小时配对：取发布时间不晚于 目标小时-lead_hours 的最新预报，配上实测。
 
     调用方必须已处于写事务中（BEGIN IMMEDIATE），保证读到同一已提交快照。
+
+    判重/排序/截止比较全部基于解析后的真实时刻（datetime），而不是文本字典序：
+    旧库整秒记录（``...:00Z``）与新的小数秒记录（``...:00.500000Z``）混存时，
+    字典序与真实时刻顺序相反，只有按真实时刻比较才能保证同秒内顺序正确。
     """
     start_s, end_s = canon(start_dt), canon(end_dt)
     forecast_rows = conn.execute(
         "SELECT target_hour, issued_at, irradiance FROM forecasts "
-        "WHERE station = ? AND target_hour BETWEEN ? AND ? "
-        "ORDER BY target_hour, issued_at",
+        "WHERE station = ? AND target_hour BETWEEN ? AND ?",
         (station, start_s, end_s),
     ).fetchall()
-    by_target: dict[str, list[tuple[str, float]]] = {}
+    # 每个目标小时下保存 (真实发布时刻, 规范文本, 辐照)，按真实时刻排序
+    by_target: dict[str, list[tuple[datetime, str, float]]] = {}
     for r in forecast_rows:
-        by_target.setdefault(r["target_hour"], []).append((r["issued_at"], r["irradiance"]))
+        issued_dt = parse_canon(r["issued_at"])
+        by_target.setdefault(r["target_hour"], []).append(
+            (issued_dt, r["issued_at"], r["irradiance"])
+        )
+    for candidates in by_target.values():
+        candidates.sort(key=lambda c: c[0])
 
     actual_rows = conn.execute(
         "SELECT target_hour, energy FROM actuals "
@@ -250,10 +281,11 @@ def build_pairs(conn, station: str, start_dt: datetime, end_dt: datetime, lead_h
     t = start_dt
     while t <= end_dt:
         target_s = canon(t)
-        cutoff_s = canon(t - lead)
+        cutoff_dt = t - lead
+        cutoff_s = canon(cutoff_dt)
         candidates = by_target.get(target_s, [])
-        issued_list = [c[0] for c in candidates]
-        idx = bisect_right(issued_list, cutoff_s) - 1  # 不晚于截止时刻的最新一条
+        # 不晚于截止时刻的最新一条（含恰在截止时刻发布的预报）
+        idx = bisect_right([c[0] for c in candidates], cutoff_dt) - 1
         chosen = candidates[idx] if idx >= 0 else None
         energy = actuals.get(target_s)
 
@@ -269,8 +301,8 @@ def build_pairs(conn, station: str, start_dt: datetime, end_dt: datetime, lead_h
             "station": station,
             "target_hour": target_s,
             "cutoff_issued_at": cutoff_s,
-            "issued_at": chosen[0] if chosen else None,
-            "irradiance": chosen[1] if chosen else None,
+            "issued_at": chosen[1] if chosen else None,
+            "irradiance": chosen[2] if chosen else None,
             "energy": energy,
             "missing_reason": missing,
             "missing_reason_cn": MISSING_REASON_CN.get(missing) if missing else None,

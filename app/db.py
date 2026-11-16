@@ -15,8 +15,8 @@ import sqlite3
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS forecasts (
     station     TEXT NOT NULL,
-    target_hour TEXT NOT NULL,   -- 目标 UTC 小时，规范形 YYYY-MM-DDTHH:00:00Z
-    issued_at   TEXT NOT NULL,   -- 发布 UTC 时刻，规范形 YYYY-MM-DDTHH:MM:SSZ
+    target_hour TEXT NOT NULL,   -- 目标 UTC 小时，规范形 YYYY-MM-DDTHH:00:00Z（必须整点）
+    issued_at   TEXT NOT NULL,   -- 发布 UTC 时刻规范形：整秒 YYYY-MM-DDTHH:MM:SSZ，含小数秒 ...SS.ffffffZ
     irradiance  REAL NOT NULL,   -- 预测辐照
     PRIMARY KEY (station, target_hour, issued_at)
 );

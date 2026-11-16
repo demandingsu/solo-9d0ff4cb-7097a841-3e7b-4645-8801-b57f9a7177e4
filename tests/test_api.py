@@ -288,3 +288,188 @@ def test_failed_generate_leaves_no_partial_result(env, monkeypatch):
     r = client.post("/datasets/dsX/generate", json=GENERATE_EXAMPLE)
     assert r.status_code == 200
     assert r.json()["replayed"] is False
+
+
+# ---------------------------------------------------------------- 小数秒精度链路
+
+def test_fractional_issued_at_preserved_and_cutoff_boundary(env):
+    """截止后 0.5 秒发布的预报必须判迟到；恰在截止时刻（含）的为准时。"""
+    client, db_file = env
+    batch = (
+        "station,target_hour,issued_at,irradiance\n"
+        "ST01,2026-03-01T00:00:00Z,2026-02-28T00:00:00Z,500.0\n"          # 恰在截止时刻
+        "ST01,2026-03-01T00:00:00Z,2026-02-28T00:00:00.500000Z,501.0\n"  # 晚 0.5 秒，迟到
+    )
+    r = client.post("/imports/forecasts", content=batch, headers=CSV_HEADERS)
+    assert r.status_code == 200
+    assert r.json()["inserted"] == 2  # 同一整秒不同小数秒：两个不同的键，不误判冲突
+
+    # 库里保留小数秒规范形，整秒记录文本与旧格式完全一致
+    conn = db.connect(db_file)
+    try:
+        stored = {
+            row["issued_at"]: row["irradiance"]
+            for row in conn.execute("SELECT issued_at, irradiance FROM forecasts")
+        }
+    finally:
+        conn.close()
+    assert stored == {
+        "2026-02-28T00:00:00Z": 500.0,
+        "2026-02-28T00:00:00.500000Z": 501.0,
+    }
+
+    params = dict(GENERATE_EXAMPLE, start_hour="2026-03-01T00:00:00Z", end_hour="2026-03-01T00:00:00Z")
+    r = client.post("/datasets/frac-cutoff/generate", json=params)
+    assert r.status_code == 200
+    row = r.json()["rows"][0]
+    assert row["cutoff_issued_at"] == "2026-02-28T00:00:00Z"
+    assert row["issued_at"] == "2026-02-28T00:00:00Z"  # 准时的那条，0.5 秒的被排除
+    assert row["irradiance"] == 500.0
+
+
+def test_same_whole_second_distinct_fractional_keys_sort_and_select_latest(env):
+    """同一整秒内两条不同小数秒预报按真实时刻排序，取最新一条。"""
+    client, _ = env
+    # 故意按“先晚后早”的顺序导入，验证生成时按真实时刻而非插入/文本顺序
+    batch = (
+        "station,target_hour,issued_at,irradiance\n"
+        "ST01,2026-03-01T01:00:00Z,2026-02-28T00:30:00.750Z,510.75\n"
+        "ST01,2026-03-01T01:00:00Z,2026-02-28T00:30:00.250Z,510.25\n"
+    )
+    assert client.post("/imports/forecasts", content=batch, headers=CSV_HEADERS).status_code == 200
+    params = dict(GENERATE_EXAMPLE, start_hour="2026-03-01T01:00:00Z", end_hour="2026-03-01T01:00:00Z")
+    r = client.post("/datasets/frac-order/generate", json=params)
+    assert r.status_code == 200
+    row = r.json()["rows"][0]
+    assert row["issued_at"] == "2026-02-28T00:30:00.750000Z"
+    assert row["irradiance"] == 510.75
+
+
+def test_equivalent_time_writings_are_same_key_and_conflict_still_rejects(env):
+    """等价时间写法（Z/+00:00、不同小数位、空格分隔）按同一键处理；同键异值整批拒收。"""
+    client, _ = env
+    # 同键同值的等价写法：幂等跳过
+    first = (
+        "station,target_hour,issued_at,irradiance\n"
+        "ST01,2026-03-01T00:00:00Z,2026-02-28T00:00:00.500000Z,500.0\n"
+    )
+    assert client.post("/imports/forecasts", content=first, headers=CSV_HEADERS).status_code == 200
+    equivalent = (
+        "station,target_hour,issued_at,irradiance\n"
+        "ST01,2026-03-01T00:00:00+00:00,2026-02-28 00:00:00.5Z,500.0\n"
+    )
+    r = client.post("/imports/forecasts", content=equivalent, headers=CSV_HEADERS)
+    assert r.status_code == 200
+    assert r.json()["skipped_duplicates"] == 1 and r.json()["inserted"] == 0
+
+    # 同键异值（批内）：整批拒收
+    conflict_batch = (
+        "station,target_hour,issued_at,irradiance\n"
+        "ST01,2026-03-01T00:00:00Z,2026-02-28T00:00:00.5Z,500.0\n"
+        "ST01,2026-03-01T00:00:00Z,2026-02-28T00:00:00.500000Z,509.0\n"
+    )
+    r = client.post("/imports/forecasts", content=conflict_batch, headers=CSV_HEADERS)
+    assert r.status_code == 409
+
+    # 同键异值（与库中已有数据）：整批拒收，正常行也不写入
+    against_db = (
+        "station,target_hour,issued_at,irradiance\n"
+        "ST01,2026-03-01T00:00:00Z,2026-02-28T00:00:00.500000Z,999.0\n"
+        "ST01,2026-03-01T05:00:00Z,2026-02-28T00:00:00Z,123.0\n"
+    )
+    r = client.post("/imports/forecasts", content=against_db, headers=CSV_HEADERS)
+    assert r.status_code == 409
+    assert table_counts(env[1])["forecasts"] == 1
+
+
+def test_legacy_whole_second_rows_mixed_with_fractional_order_correctly(env):
+    """旧库整秒记录与新小数秒记录混存：真实时刻顺序正确，旧记录仍可被选中。"""
+    client, _ = env
+    # 模拟旧库遗留的整秒记录（文本与旧版本完全一致）
+    legacy = (
+        "station,target_hour,issued_at,irradiance\n"
+        "ST01,2026-03-01T01:00:00Z,2026-02-28T00:30:00Z,510.0\n"
+    )
+    assert client.post("/imports/forecasts", content=legacy, headers=CSV_HEADERS).status_code == 200
+    # 新导入的小数秒记录：一条更早、一条更晚（文本字典序里 .500000Z 反而排在 Z 前面）
+    new_batch = (
+        "station,target_hour,issued_at,irradiance\n"
+        "ST01,2026-03-01T01:00:00Z,2026-02-28T00:29:59.900000Z,509.9\n"
+        "ST01,2026-03-01T01:00:00Z,2026-02-28T00:30:00.100000Z,510.1\n"
+    )
+    assert client.post("/imports/forecasts", content=new_batch, headers=CSV_HEADERS).status_code == 200
+
+    params = dict(GENERATE_EXAMPLE, start_hour="2026-03-01T01:00:00Z", end_hour="2026-03-01T01:00:00Z")
+    r = client.post("/datasets/mixed/generate", json=params)
+    row = r.json()["rows"][0]
+    # 截止 01:00，三条都准时；最新的是 00:30:00.100000（真实时刻晚于整秒 00:30:00）
+    assert row["issued_at"] == "2026-02-28T00:30:00.100000Z"
+    assert row["irradiance"] == 510.1
+
+    # 截止恰为整秒：旧整秒记录准时入选，晚 1 微秒的新记录迟到
+    boundary_batch = (
+        "station,target_hour,issued_at,irradiance\n"
+        "ST02,2026-03-01T00:00:00Z,2026-02-28T00:00:00Z,100.0\n"
+        "ST02,2026-03-01T00:00:00Z,2026-02-28T00:00:00.000001Z,100.001\n"
+    )
+    assert client.post("/imports/forecasts", content=boundary_batch, headers=CSV_HEADERS).status_code == 200
+    params2 = dict(GENERATE_EXAMPLE, station="ST02",
+                   start_hour="2026-03-01T00:00:00Z", end_hour="2026-03-01T00:00:00Z")
+    row2 = client.post("/datasets/mixed-boundary/generate", json=params2).json()["rows"][0]
+    # 截止 = 2026-02-28T00:00:00Z：整秒旧记录准时入选，晚 1 微秒的新记录迟到
+    assert row2["issued_at"] == "2026-02-28T00:00:00Z"
+    assert row2["irradiance"] == 100.0
+
+
+def test_fractional_target_hour_is_not_treated_as_whole_hour(env):
+    """带小数秒的目标小时不能当成整点：导入与生成参数一律 422。"""
+    client, _ = env
+    bad_import = (
+        "station,target_hour,issued_at,irradiance\n"
+        "ST01,2026-03-01T00:00:00.5Z,2026-02-27T08:00:00Z,500.0\n"
+    )
+    r = client.post("/imports/forecasts", content=bad_import, headers=CSV_HEADERS)
+    assert r.status_code == 422
+    assert table_counts(env[1])["forecasts"] == 0
+
+    bad_actual = (
+        "station,target_hour,energy\n"
+        "ST01,2026-03-01T00:00:00.500000Z,48.2\n"
+    )
+    assert client.post("/imports/actuals", content=bad_actual, headers=CSV_HEADERS).status_code == 422
+
+    bad_params = dict(GENERATE_EXAMPLE, start_hour="2026-03-01T00:00:00.5Z")
+    assert client.post("/datasets/bad-hour/generate", json=bad_params).status_code == 422
+
+
+def test_fractional_precision_does_not_change_legacy_dataset_replay(env):
+    """旧数据集按原号原参数重试仍返回原快照（规范形不变，replayed=true）。"""
+    client, _ = env
+    import_demo(client)
+    first = client.post("/datasets/legacy-ds/generate", json=GENERATE_EXAMPLE).json()
+    assert first["replayed"] is False
+
+    # 导入带小数秒的新预报（可能改变配对）后，同号同参数重试仍是原快照
+    extra = (
+        "station,target_hour,issued_at,irradiance\n"
+        "ST01,2026-03-01T00:00:00Z,2026-02-27T20:00:00.250Z,777.0\n"
+    )
+    assert client.post("/imports/forecasts", content=extra, headers=CSV_HEADERS).status_code == 200
+    second = client.post("/datasets/legacy-ds/generate", json=GENERATE_EXAMPLE).json()
+    assert second["replayed"] is True
+    assert second["rows"] == first["rows"]
+    assert second["created_at"] == first["created_at"]
+    # GET 读回的快照也完全一致
+    assert client.get("/datasets/legacy-ds").json()["rows"] == first["rows"]
+
+
+def test_sub_microsecond_fraction_rejected(env):
+    """超出微秒精度（多于 6 位小数）无法无损表示，整批 422 拒绝。"""
+    client, _ = env
+    batch = (
+        "station,target_hour,issued_at,irradiance\n"
+        "ST01,2026-03-01T00:00:00Z,2026-02-28T00:00:00.1234567Z,500.0\n"
+    )
+    r = client.post("/imports/forecasts", content=batch, headers=CSV_HEADERS)
+    assert r.status_code == 422
+    assert table_counts(env[1])["forecasts"] == 0

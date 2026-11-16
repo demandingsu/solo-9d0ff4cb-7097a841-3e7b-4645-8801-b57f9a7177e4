@@ -21,6 +21,14 @@ ST01,2026-03-01T01:00:00Z,2026-02-28T00:30:00Z,510.0
 ST01,2026-03-01T03:00:00Z,2026-02-27T09:00:00Z,520.0
 """
 
+# 小数秒精度专项示例（对应截止边界与同秒排序）
+FRACTIONAL_FORECAST_CSV_EXAMPLE = """station,target_hour,issued_at,irradiance
+ST02,2026-03-01T00:00:00Z,2026-02-28T00:00:00Z,500.0
+ST02,2026-03-01T00:00:00Z,2026-02-28T00:00:00.500000Z,501.0
+ST02,2026-03-01T01:00:00Z,2026-02-28T00:30:00.250Z,510.25
+ST02,2026-03-01T01:00:00Z,2026-02-28T00:30:00.750Z,510.75
+"""
+
 ACTUAL_CSV_EXAMPLE = """station,target_hour,energy
 ST01,2026-03-01T00:00:00Z,48.2
 ST01,2026-03-01T01:00:00Z,49.1
@@ -49,6 +57,14 @@ API_DESCRIPTION = """
 对每个目标小时，发布截止时刻 = `目标小时 - lead_hours`。
 只采用 `issued_at <= 截止时刻` 的预报，取其中**最新**一条；晚于截止时刻发布的预报视为**迟到预报**，不参与配对。
 每行结果都带回 `cutoff_issued_at`（截止时刻）与实际采用的 `issued_at`（来源时刻），迟到预报可在导入后通过对比发现。
+
+## 时间精度（小数秒）
+
+- 发布时刻 `issued_at` 保留合法 ISO 8601 小数秒（微秒精度，如 `2026-02-28T00:00:00.5Z`），不再截断到整秒：
+  截止时刻后 0.5 秒发布的预报会被正确判为迟到；同一整秒内不同小数秒的两条预报是**两个不同的键**，不会误判冲突。
+- 等价写法（`Z` / `+00:00`、`0.5` 与 `0.500000`）规范化为同一字符串，按同一个业务键处理；同键异值仍整批拒收。
+- 旧库整秒记录（`...:00Z`）与新的小数秒记录（`...:00.500000Z`）混存时，排序与截止比较按**真实时刻**而非文本字典序，顺序保持正确。
+- 目标小时与生成区间必须**整点对齐**：带小数秒的目标小时（如 `...T00:00:00.5Z`）在导入与生成时一律 422 拒绝。
 
 ## 缺配原因（missing_reason）
 
@@ -103,8 +119,8 @@ app = FastAPI(
 
 class GenerateParams(BaseModel):
     station: str = Field(min_length=1, max_length=128, description="场站编号", examples=["ST01"])
-    start_hour: str = Field(description="起始目标 UTC 小时（整点）", examples=["2026-03-01T00:00:00Z"])
-    end_hour: str = Field(description="结束目标 UTC 小时（整点，含）", examples=["2026-03-01T03:00:00Z"])
+    start_hour: str = Field(description="起始目标 UTC 小时（整点；带小数秒的非整点会被拒绝）", examples=["2026-03-01T00:00:00Z"])
+    end_hour: str = Field(description="结束目标 UTC 小时（整点，含；带小数秒的非整点会被拒绝）", examples=["2026-03-01T03:00:00Z"])
     lead_hours: int = Field(ge=0, le=24 * 90, description="提前小时数：只采用 目标小时-lead_hours 之前发布的预报", examples=[24])
 
 
@@ -226,7 +242,10 @@ def health():
     "/imports/forecasts",
     tags=["imports"],
     summary="导入预报 CSV",
-    description="整批原子导入。同键（场站+目标小时+发布时刻）同值幂等跳过；同键异值整批拒收（409）。",
+    description=(
+        "整批原子导入。同键（场站+目标小时+发布时刻）同值幂等跳过；同键异值整批拒收（409）。"
+        "发布时刻保留 ISO 8601 小数秒；等价时间写法按同一键处理，同一整秒内不同小数秒为不同键。"
+    ),
 )
 def import_forecasts(
     csv_text: str = Body(
@@ -240,6 +259,15 @@ def import_forecasts(
                     "属于迟到预报，不会被采用**，配对结果将使用 500.0（2026-02-27T08:00:00Z 发布）。"
                 ),
                 "value": FORECAST_CSV_EXAMPLE,
+            },
+            "小数秒精度批次": {
+                "summary": "小数秒示例（截止边界 + 同秒不同时刻）",
+                "description": (
+                    "目标小时 2026-03-01T00:00:00Z、lead_hours=24 时截止时刻为 2026-02-28T00:00:00Z："
+                    "恰在截止时刻的 500.0 准时可用，晚 0.5 秒的 501.0 被判迟到。"
+                    "01 时的 00:30:00.250 与 00:30:00.750 是同一整秒内的两个不同键，取最新的 .750 一条。"
+                ),
+                "value": FRACTIONAL_FORECAST_CSV_EXAMPLE,
             },
         },
     ),
